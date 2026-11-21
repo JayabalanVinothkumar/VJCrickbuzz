@@ -379,7 +379,7 @@ async function espnDetail(seriesId, matchId) {
   let current = null;
   const lastBall = items[0];
   if (state === "live" && lastBall) {
-    const bat = (o, star) => o?.athlete ? { name: o.athlete.displayName, r: o.runs ?? o.totalRuns, b: o.faced, f: o.fours, s: o.sixes, sr: o.faced ? (100 * (o.runs ?? 0) / o.faced) : null, cur: star ? 1 : 0, played: true } : null;
+    const bat = (o, star) => o?.athlete ? { name: o.athlete.displayName, r: o.totalRuns ?? o.runs, b: o.faced, f: o.fours, s: o.sixes, sr: o.faced ? (100 * (o.totalRuns ?? o.runs ?? 0) / o.faced) : null, cur: star ? 1 : 0, played: true } : null;
     const bowl = (o, star) => o?.athlete ? { name: o.athlete.displayName + (star ? " *" : ""), o: oversFromBalls(o.balls) || o.overs, m: o.maidens, r: o.conceded, w: o.wickets, eco: o.balls ? o.conceded / (o.balls / 6) : null } : null;
     current = { bat: [bat(lastBall.batsman, true), bat(lastBall.otherBatsman)].filter(Boolean), bowl: [bowl(lastBall.bowler, true), bowl(lastBall.otherBowler)].filter(Boolean), inn: lastBall.innings || {} };
   }
@@ -396,9 +396,8 @@ async function espnDetail(seriesId, matchId) {
 const COLORS = ["#0b6e45", "#1565c0", "#ad1457", "#6a1b9a", "#ef6c00", "#00838f", "#5d4037", "#c62828", "#2e7d32", "#283593"];
 function logo(t, cls = "") {
   const c = COLORS[[...(t.short || t.name || "?")].reduce((a, ch) => a + ch.charCodeAt(0), 0) % COLORS.length];
-  const txt = `<span class="logo txt ${cls}" style="background:${c}">${esc((t.short || "?").slice(0, 3))}</span>`;
-  if (!t.logo) return txt;
-  return `<img class="logo ${cls}" src="${esc(t.logo)}" alt="" loading="lazy" onerror="this.outerHTML=this.dataset.f" data-f='${txt.replace(/'/g, "&#39;")}'>`;
+  const img = t.logo ? `<img src="${esc(t.logo)}" alt="" onload="this.style.opacity=1" onerror="this.remove()" style="position:absolute;inset:0;width:100%;height:100%;border-radius:50%;object-fit:contain;background:#fff;opacity:0;transition:opacity .2s">` : "";
+  return `<span class="logo txt ${cls}" style="background:${c};position:relative;overflow:hidden">${esc((t.short || "?").slice(0, 3))}${img}</span>`;
 }
 function teamRow(t, m, big) {
   const dim = m.state === "recent" && m.teams.some(x => x.winner) && !t.winner;
