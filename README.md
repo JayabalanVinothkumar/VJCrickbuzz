@@ -17,30 +17,17 @@ All data (live scores, full scorecards, ball-by-ball commentary, match info, new
 | `manifest.webmanifest`, `sw.js`, `icon-*.png` | home-screen install + offline shell |
 | `relay/worker.js` | the free Cloudflare Worker that fetches ESPNcricinfo data for the app |
 
-## Setup (about 10 minutes, free)
+## Where the data comes from
+- **Scores, scorecards, commentary, match info:** ESPNcricinfo's data through ESPN's public sports API (`site.web.api.espn.com`), called directly from the phone. ESPNcricinfo's own API blocks server requests, so this route is used instead; the match IDs are the same.
+- **News:** the ESPNcricinfo news RSS feed, fetched by the Cloudflare Worker `crease-relay` (`https://crease-relay.vinoth-jey.workers.dev`), because Safari can't read that feed directly. The relay address is built into the app.
+- If ESPN can't be reached, the app falls back to ESPNcricinfo's live-scores RSS (via the relay), then to the last saved scores.
 
-### 1. Put the app on GitHub Pages
-1. On github.com create a new public repository named **`VJCrickbuzz`**.
-2. Upload `index.html`, `manifest.webmanifest`, `sw.js`, `icon-180.png`, `icon-192.png`, `icon-512.png` (the `relay` folder can go too; it is not used by the page).
-3. **Settings → Pages →** Source: *Deploy from a branch*, branch `main`, folder `/ (root)` → Save.
-4. After a minute the app is at `https://jayabalanvinothkumar.github.io/VJCrickbuzz/`.
+## Live setup
+- App: https://jayabalanvinothkumar.github.io/VJCrickbuzz/ (GitHub Pages, `main` branch)
+- Relay: Cloudflare Worker `crease-relay` on the vinoth-jey.workers.dev subdomain, code in `relay/worker.js`
 
-### 2. Create the relay (Cloudflare Worker)
-Safari blocks a web page from reading ESPNcricinfo directly, so this tiny Worker fetches the data for you.
-1. **dash.cloudflare.com → Workers & Pages → Create →** "Hello World" Worker, name it `crease-relay`, **Deploy**.
-2. **Edit code**, delete everything, paste the full content of `relay/worker.js`, **Deploy**.
-3. Optional but recommended: **Settings → Variables and Secrets → Add →** type *Secret*, name `RELAY_KEY`, any password. Deploy.
-4. Check it in Safari: `https://crease-relay.<your-subdomain>.workers.dev/ping` should show `{"ok":true,...}`.
-
-### 3. Install on the iPhone
-1. Open `https://jayabalanvinothkumar.github.io/VJCrickbuzz/` in **Safari**.
-2. Share button → **Add to Home Screen** → Add.
-3. Open Crease from the home screen → **More** → enter the relay URL (and password) → **Save** → **Test relay**.
-   It should say "✅ Works – N matches found".
-
-## How the data is fetched
-The relay first asks ESPNcricinfo's JSON API (the same one their own site uses). If that is refused, it loads the normal espncricinfo.com page and reads the data embedded in it. If both fail, the app falls back to ESPNcricinfo's live-scores RSS feed (basic scores only), then to the last saved scores.
-ESPNcricinfo can change its site at any time; if scores stop loading, the **Test relay** message shows the reason.
+## Install on the iPhone
+Open the app link in **Safari** → Share → **Add to Home Screen**.
 
 ## Updating
 Change files, upload them to the repo again, and bump `CACHE = "crease-v1"` in `sw.js` (v2, v3 …) so the iPhone picks up the new version. Close and reopen the app twice.
