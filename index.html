@@ -163,7 +163,7 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem("crease." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem("crease." + k, JSON.stringify(v)); } catch {} },
 };
-let cfg = Object.assign({ relay: "", key: "", refresh: 20, demo: false }, store.get("cfg", {}));
+let cfg = Object.assign({ relay: "https://crease-relay.vinoth-jey.workers.dev", key: "", refresh: 20, demo: false }, store.get("cfg", {}));
 const saveCfg = () => store.set("cfg", cfg);
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("show"), 2200); }
 
