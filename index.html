@@ -156,7 +156,7 @@ table.t td b{font-weight:700}
 
 <script>
 "use strict";
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const store = {
@@ -248,24 +248,46 @@ function normMatch(m) {
 const isMatchArr = a => a[0] && typeof a[0] === "object" && Array.isArray(a[0].teams) && ("objectId" in a[0] || "id" in a[0]) && (a[0].series || a[0].statusText != null);
 
 let lastSource = "";
+/* ESPN's public sports API carries ESPNcricinfo's data (same match IDs) and allows
+   direct calls from the phone, so no relay is needed for scores. */
+const ESPN = "https://site.web.api.espn.com/apis";
+async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }
+const stateOf = s => s === "in" ? "live" : s === "pre" ? "upcoming" : "recent";
+function splitScore(x) { x = String(x || "").trim(); const m = x.match(/^(.*?)\s*\(([^)]*)\)\s*$/); return m ? { score: m[1].trim(), info: m[2] } : { score: x, info: "" }; }
+function espnTeam(c, batId) {
+  c = c || {}; const t = c.team || c; const id = String(t.id ?? c.id ?? "");
+  const sc = splitScore(c.score);
+  return { id, name: t.displayName || c.displayName || t.name || "TBA", short: t.abbreviation || c.abbreviation || "", logo: t.logos?.[0]?.href || c.logo || "",
+    score: sc.score, info: sc.info, live: batId != null && String(batId) === id, winner: !!c.winner, national: !!(c.isNational ?? t.isNational) };
+}
+function espnStatus(type, summary, state) {
+  const d = type?.description || "";
+  if (state === "live") return [d && !/^(live|in progress)$/i.test(d) ? d : "", summary].filter(Boolean).join(" • ");
+  if (state === "upcoming") return summary && !/^scheduled$/i.test(summary) ? summary : "";
+  return summary || d;
+}
+function espnMatch(e, L) {
+  const fs = e.fullStatus || {}; const state = stateOf(fs.type?.state || e.status);
+  const teams = (e.competitors || []).map(c => espnTeam(c, state === "live" ? fs.battingTeamId : null));
+  return { id: String(e.id), seriesId: String(L?.id ?? ""), series: L?.name || "", title: e.title || "", format: e.class?.eventType || e.class?.generalClassCard || "",
+    state, status: espnStatus(fs.type, fs.longSummary || fs.summary || e.summary, state), start: e.date, ground: e.location || "", town: "", teams,
+    intl: teams.length > 0 && teams.every(t => t.national), link: `https://www.espncricinfo.com/ci/engine/match/${e.id}.html` };
+}
 async function getMatches() {
   if (cfg.demo) { lastSource = "demo"; return DEMO.matches.map(normMatch); }
   try {
-    const d = await api("pages/matches/current", { latest: "true" });
-    const map = new Map();
-    for (const arr of collect(d, isMatchArr)) for (const m of arr) { const n = normMatch(m); if (n.id != null && !map.has(n.id)) map.set(n.id, n); }
-    if (!map.size) throw new Error("No matches in response");
-    const list = [...map.values()];
-    store.set("cache.matches", list.map(x => ({ ...x, raw: null })));
+    const h = await getJSON(ESPN + "/v2/scoreboard/header?sport=cricket&lang=en&region=gb");
+    const list = [];
+    for (const L of h.sports?.[0]?.leagues || []) for (const e of L.events || []) list.push(espnMatch(e, L));
+    if (!list.length) throw new Error("No matches right now");
+    store.set("cache.matches", list);
     lastSource = "live";
     return list;
   } catch (e) {
-    if (e.message !== "NO_RELAY") {
-      try { const l = await rssMatches(); if (l.length) { lastSource = "rss"; return l; } } catch {}
-    }
+    try { if (cfg.relay) { const l = await rssMatches(); if (l.length) { lastSource = "rss"; return l; } } } catch {}
     const c = store.get("cache.matches", null);
-    if (c && c.length && e.message !== "NO_RELAY") { lastSource = "cache"; return c; }
-    lastSource = e.message === "NO_RELAY" ? "norelay" : "error:" + e.message;
+    if (c && c.length) { lastSource = "cache"; return c; }
+    lastSource = "error:" + e.message;
     return DEMO.matches.map(normMatch);
   }
 }
@@ -284,12 +306,90 @@ async function rssMatches() {
 
 async function getMatchDetail(seriesId, matchId) {
   if (cfg.demo || String(matchId).startsWith("demo")) return DEMO.detail[matchId] || DEMO.detail.demo1;
-  const [sc, cm] = await Promise.allSettled([
-    api("pages/match/scorecard", { seriesId, matchId }),
-    api("pages/match/comments", { seriesId, matchId, sortDirection: "DESC" }),
-  ]);
-  if (sc.status === "rejected" && cm.status === "rejected") throw sc.reason;
-  return { sc: sc.value || null, cm: cm.value || null };
+  return espnDetail(seriesId, matchId);
+}
+function statMap(st) { const m = {}; for (const c of st?.categories || []) for (const x of c.stats || []) m[x.name] = x.displayValue ?? x.value; return m; }
+const DIS = { c: "caught", b: "bowled", lbw: "lbw", st: "stumped", ro: "run out", hw: "hit wicket", rtd: "retired", "c&b": "caught & bowled", obs: "obstructing the field" };
+const oversFromBalls = b => b == null ? "" : `${Math.floor(b / 6)}${b % 6 ? "." + (b % 6) : ""}`;
+const stripHtml = h => h ? new DOMParser().parseFromString(String(h).replace(/<br\s*\/?>/gi, "\n"), "text/html").body.textContent.trim() : "";
+async function espnDetail(seriesId, matchId) {
+  const base = `${ESPN}/site/v2/sports/cricket/${seriesId}`;
+  const sum = await getJSON(`${base}/summary?event=${matchId}`);
+  const comp = sum.header?.competitions?.[0] || {};
+  const st = comp.status || {}; const state = stateOf(st.type?.state);
+  const comps = comp.competitors || [];
+  const match = { id: String(matchId), seriesId: String(seriesId), series: sum.header?.league?.name || "", title: comp.description || "", format: comp.class?.generalClassCard || comp.class?.eventType || "",
+    state, status: espnStatus(st.type, st.summary, state), start: comp.date, ground: sum.gameInfo?.venue?.fullName || "", town: "",
+    teams: comps.map(c => espnTeam(c, state === "live" ? st.battingTeamId : null)), link: `https://www.espncricinfo.com/ci/engine/match/${matchId}.html` };
+
+  // ball-by-ball: the newest two pages (25 balls each)
+  let items = [];
+  if (state !== "upcoming") {
+    const pageOf = p => getJSON(`${base}/playbyplay?event=${matchId}&page=${p}`).then(r => r.commentary || {}).catch(() => null);
+    let last = Math.ceil((+comp.commentaryCount || 0) / 25);
+    if (!last) { const first = await pageOf(1); last = first?.pageCount || 0; if (last <= 1 && first) items = first.items || []; }
+    if (last >= 1 && !items.length) { const pages = await Promise.all([last, last - 1].filter(n => n >= 1).map(pageOf)); for (const pg of pages) if (pg) items.push(...(pg.items || [])); }
+    items.sort((a, b) => (b.sequence || 0) - (a.sequence || 0));
+  }
+  const comments = items.map(c => {
+    const pt = String(c.playType?.description || "").toLowerCase();
+    return { id: c.id, inn: c.period, ov: c.over?.overs != null ? Number(c.over.overs).toFixed(1) : "", over: c.over?.number,
+      title: c.shortText || "", text: stripHtml(c.text), post: stripHtml(c.postText), pre: stripHtml(c.preText),
+      runs: c.scoreValue ?? 0, four: pt === "four", six: pt === "six", wkt: !!c.dismissal?.dismissal,
+      wd: pt.includes("wide") ? 1 : 0, nb: pt.includes("no ball") ? 1 : 0, lb: pt === "leg bye" ? 1 : 0, by: pt === "bye" ? 1 : 0,
+      dis: c.dismissal?.dismissal ? String(c.dismissal.text || "").replace(/\s+/g, " ").trim() : "", batId: c.dismissal?.batsman?.athlete?.id, raw: c };
+  });
+
+  // innings, built from each player's per-innings figures
+  const innings = [];
+  for (const c of comps) for (const l of c.linescores || []) {
+    if (!l.isBatting) continue;
+    const x = statMap(l.statistics);
+    innings.push({ no: l.period, teamId: String(c.team?.id ?? c.id), team: espnTeam(c, null), runs: l.runs, wkts: l.wickets, overs: l.overs, target: l.target || null, cur: !!l.isCurrent, desc: l.description || "",
+      extras: x.extras, b: +x.byes || 0, lb: +x.legbyes || 0, w: +x.wides || 0, nb: +x.noballs || 0, p: +x.penalties || 0, bat: [], bowl: [], fow: [], parts: [] });
+  }
+  innings.sort((a, b) => a.no - b.no);
+  const rosters = sum.rosters || [];
+  for (const inn of innings) {
+    const bt = rosters.find(r => String(r.team?.id) === inn.teamId), bw = rosters.find(r => String(r.team?.id) !== inn.teamId);
+    const per = p => { const l = (p.linescores || []).find(q => q.period === inn.no); return l ? statMap(l.linescores?.[0]?.statistics || l.statistics) : {}; };
+    const nm = p => p.athlete?.displayName || p.athlete?.battingName || "";
+    for (const p of bt?.roster || []) {
+      const x = per(p);
+      if (+x.batted) inn.bat.push({ pos: +x.battingPosition || 99, id: p.athlete?.id, name: nm(p), played: true, r: x.runs, b: x.ballsFaced, f: x.fours || 0, s: x.sixes || 0, sr: x.strikeRate,
+        out: +x.outs > 0, dis: +x.outs > 0 ? (DIS[x.dismissalCard] || "out") : (x.retiredDescription || "not out") });
+      else if (p.starter !== false) inn.bat.push({ pos: 200, name: nm(p), played: false });
+    }
+    inn.bat.sort((a, b) => a.pos - b.pos);
+    for (const p of bw?.roster || []) {
+      const x = per(p);
+      if (+x.bowled || +x.balls) inn.bowl.push({ pos: +x.bowlingPosition || 99, name: nm(p), o: x.overs, m: x.maidens || 0, r: x.conceded, w: x.wickets || 0, eco: x.economyRate });
+    }
+    inn.bowl.sort((a, b) => a.pos - b.pos);
+  }
+  for (const mc of sum.matchcards || []) {
+    const inn = innings.find(i => String(i.no) === String(mc.inningsNumber)); if (!inn) continue;
+    if (mc.headline === "Batting") for (const d of mc.playerDetails || []) { const b = inn.bat.find(q => q.id === d.playerID); if (b && b.out && d.dismissal) b.dis = d.dismissal; }
+    if (mc.headline === "Partnerships") inn.parts = (mc.playerDetails || []).map(q => ({ wk: q.partnershipWicketName, runs: q.partnershipRuns, overs: q.partnershipOvers, a: q.player1Name, ar: q.player1Runs, b: q.player2Name, br: q.player2Runs }));
+  }
+  // full dismissal wording from the commentary, where we have it
+  for (const c of comments) if (c.wkt && c.batId && c.dis) for (const inn of innings) { const b = inn.bat.find(q => q.id === c.batId && q.out); if (b) { const t = c.dis.replace(/\s+\d+\s*\(.*$/, "").trim(); b.dis = t.startsWith(b.name) ? t.slice(b.name.length).trim() : t; } }
+
+  // who is at the crease right now
+  let current = null;
+  const lastBall = items[0];
+  if (state === "live" && lastBall) {
+    const bat = (o, star) => o?.athlete ? { name: o.athlete.displayName, r: o.runs ?? o.totalRuns, b: o.faced, f: o.fours, s: o.sixes, sr: o.faced ? (100 * (o.runs ?? 0) / o.faced) : null, cur: star ? 1 : 0, played: true } : null;
+    const bowl = (o, star) => o?.athlete ? { name: o.athlete.displayName + (star ? " *" : ""), o: oversFromBalls(o.balls) || o.overs, m: o.maidens, r: o.conceded, w: o.wickets, eco: o.balls ? o.conceded / (o.balls / 6) : null } : null;
+    current = { bat: [bat(lastBall.batsman, true), bat(lastBall.otherBatsman)].filter(Boolean), bowl: [bowl(lastBall.bowler, true), bowl(lastBall.otherBowler)].filter(Boolean), inn: lastBall.innings || {} };
+  }
+
+  const note = t => (sum.notes || comp.notes || []).filter(n => n.type === t).map(n => n.text).join("; ");
+  const pom = (st.featuredAthletes || []).filter(f => /match/i.test(f.displayName || f.name || "")).map(f => f.athlete?.displayName).filter(Boolean).join(", ");
+  const info = [["Match", match.title], ["Series", match.series], ["Format", match.format], ["Date", fmtStart(match.start)], ["Match days", note("matchdays")],
+    ["Venue", match.ground], ["Toss", note("toss").replace(/\s+,/g, ",")], ["Hours of play", note("hoursofplay")], ["Player of the match", pom],
+    ["Officials", (sum.gameInfo?.officials || []).map(o => o.displayName).filter(Boolean).join(", ")], ["Status", match.status]].filter(r => r[1]);
+  return { espn: true, match, innings, comments, current, info };
 }
 
 /* ---------------- shared UI bits ---------------- */
@@ -322,7 +422,6 @@ function matchCard(m) {
     <div class="status st-${m.state}">${esc(status)}</div></a>`;
 }
 function sourceBanner() {
-  if (lastSource === "norelay") return `<div class="banner">📺 Showing demo data. Connect your relay to get live ESPNcricinfo scores.<button onclick="location.hash='#more'">Set up</button></div>`;
   if (lastSource === "demo") return `<div class="banner">Demo mode is on.<button onclick="location.hash='#more'">Change</button></div>`;
   if (lastSource === "cache") return `<div class="banner">⚠️ Offline or ESPNcricinfo didn't answer – showing last saved scores.</div>`;
   if (lastSource === "rss") return `<div class="banner">Basic scores only (fallback feed). Full scorecards will return when ESPNcricinfo answers again.</div>`;
@@ -330,7 +429,7 @@ function sourceBanner() {
   return "";
 }
 const order = { live: 0, recent: 1, upcoming: 2 };
-function sortMatches(list) { return [...list].sort((a, b) => order[a.state] - order[b.state] || (a.state === "upcoming" ? new Date(a.start) - new Date(b.start) : new Date(b.start) - new Date(a.start))); }
+function sortMatches(list) { return [...list].sort((a, b) => order[a.state] - order[b.state] || (b.intl ? 1 : 0) - (a.intl ? 1 : 0) || (a.state === "upcoming" ? new Date(a.start) - new Date(b.start) : new Date(b.start) - new Date(a.start))); }
 const ago = () => `<div class="upd">Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</div>`;
 
 /* ---------------- views ---------------- */
@@ -348,7 +447,7 @@ async function viewHome(quiet) {
      <div class="hscroll">${(featured.length ? featured : ms.slice(0, 8)).map(matchCard).join("") || `<div class="empty">No matches right now</div>`}</div>` +
     (up.length ? `<div class="sec">Upcoming</div><div class="hscroll">${up.map(matchCard).join("")}</div>` : "") +
     `<div class="sec">Latest news <a href="#news">More</a></div>` +
-    (news.length ? news.slice(0, 6).map(newsItem).join("") : `<div class="empty">News appears once the relay is connected.</div>`) + ago();
+    (news.length ? news.slice(0, 6).map(newsItem).join("") : `<div class="empty">No news right now.</div>`) + ago();
 }
 
 let matchSeg = "live";
@@ -453,15 +552,18 @@ async function viewMatch(seriesId, matchId, quiet) {
   }
   try { detail = await getMatchDetail(seriesId, matchId); }
   catch (e) {
-    V.innerHTML = (cached ? headBlock(cached) : "") + `<div class="empty">Couldn't load this match: ${esc(e.message === "NO_RELAY" ? "relay not set up" : e.message)}</div>` +
+    V.innerHTML = (cached ? headBlock(cached) : "") + `<div class="empty">Couldn't load this match: ${esc(e.message)}</div>` +
       (cached?.link ? `<a class="btn ghost" href="${esc(cached.link)}" target="_blank" rel="noopener">Open on ESPNcricinfo</a>` : "");
     return;
   }
-  const raw = matchInfoObj(detail);
-  detail.match = raw ? normMatch(raw) : cached;
-  detail.raw = raw || cached?.raw || {};
-  detail.innings = normInnings(detail.sc);
-  detail.comments = normComments(detail.cm);
+  if (!detail.espn) {
+    const raw = matchInfoObj(detail);
+    detail.match = raw ? normMatch(raw) : cached;
+    detail.raw = raw || cached?.raw || {};
+    detail.innings = normInnings(detail.sc);
+    detail.comments = normComments(detail.cm);
+  }
+  if (!detail.match) detail.match = cached;
   detail.ids = { seriesId, matchId };
   const st = detail.match?.state || "recent";
   const tabs = [["live", st === "upcoming" ? "Preview" : "Live"], ["scorecard", "Scorecard"], ["comm", "Commentary"], ["info", "Info"]];
@@ -514,7 +616,18 @@ function liveTab() {
   if (m?.state === "upcoming") return infoTab();
   const inn = detail.innings[detail.innings.length - 1];
   let h = "";
-  if (inn) {
+  const cur = detail.current;
+  if (cur) {
+    const ci = cur.inn || {};
+    h += `<div class="box"><h4><span>${esc(inn?.team.name || "Batting")}</span><span>${inn ? `${esc(inn.runs ?? "")}/${esc(inn.wkts ?? "")} (${esc(inn.overs ?? "")} ov)` : ""}</span></h4>${batTable(cur.bat, true)}</div>`;
+    if (cur.bowl.length) h += `<div class="box"><h4><span>Bowling</span></h4>${bowlTable(cur.bowl)}</div>`;
+    const need = ci.target > 0 ? ci.target - (ci.runs ?? 0) : 0;
+    const bits = [ci.runRate != null && `CRR ${(+ci.runRate).toFixed(2)}`, ci.target > 0 && `Target ${ci.target}`, need > 0 && ci.remainingBalls > 0 && `Need ${need} from ${ci.remainingBalls} balls`,
+      need > 0 && ci.remainingBalls > 0 && `RRR ${(need / (ci.remainingBalls / 6)).toFixed(2)}`, ci.leadBy > 0 && `Lead by ${ci.leadBy}`, ci.trailBy > 0 && `Trail by ${ci.trailBy}`].filter(Boolean);
+    if (bits.length) h += `<div class="box"><div class="line">${bits.map(esc).join(" • ")}</div></div>`;
+    const lw = detail.comments.find(c => c.wkt && c.dis);
+    if (lw) h += `<div class="box"><div class="line"><span class="mut">Last wicket:</span> ${esc(lw.dis)}</div></div>`;
+  } else if (inn) {
     const atCrease = inn.bat.filter(b => b.played && b.out === false);
     const curBowl = inn.bowl.filter(b => b.cur === 1 || b.cur === 2);
     h += `<div class="box"><h4><span>${esc(inn.team.name)} – batting</span><span>${esc(inn.runs ?? "")}/${esc(inn.wkts ?? "")} (${esc(inn.overs ?? "")})</span></h4>${batTable(atCrease.length ? atCrease : inn.bat.filter(b => b.played).slice(-2), true)}</div>`;
@@ -535,8 +648,8 @@ function scoreTab() {
   const ins = detail.innings;
   if (!ins.length) return `<div class="empty">Scorecard not available yet.</div>`;
   const inn = ins[innSel] || ins[ins.length - 1];
-  const multi = ins.length > 2;
-  const chips = `<div class="chips">${ins.map((x, i) => `<button data-inn="${i}" class="${i === innSel ? "on" : ""}">${esc(x.team.short || x.team.name)}${multi ? ` ${x.no > 2 ? "2nd" : "1st"} Inns` : ""}</button>`).join("")}</div>`;
+  const multi = ins.length > 2, seen = {};
+  const chips = `<div class="chips">${ins.map((x, i) => { const k = x.team.short || x.team.name; seen[k] = (seen[k] || 0) + 1; return `<button data-inn="${i}" class="${i === innSel ? "on" : ""}">${esc(k)}${multi ? ` ${seen[k] > 1 ? "2nd" : "1st"} Inns` : ""}</button>`; }).join("")}</div>`;
   const played = inn.bat.filter(b => b.played), dnb = inn.bat.filter(b => !b.played);
   const ex = [inn.b && `b ${inn.b}`, inn.lb && `lb ${inn.lb}`, inn.w && `w ${inn.w}`, inn.nb && `nb ${inn.nb}`, inn.p && `p ${inn.p}`].filter(Boolean).join(", ");
   const [o, bb] = String(inn.overs ?? "0").split(".").map(Number); const balls = o * 6 + (bb || 0);
@@ -545,9 +658,10 @@ function scoreTab() {
     ${batTable(played)}
     <div class="line" style="display:flex;justify-content:space-between"><span>Extras</span><span><b>${esc(inn.extras ?? 0)}</b> <span class="mut">${ex ? "(" + esc(ex) + ")" : ""}</span></span></div>
     <div class="line" style="display:flex;justify-content:space-between"><b>Total</b><span><b>${esc(inn.runs ?? "")}/${esc(inn.wkts ?? "")}</b> <span class="mut">(${esc(inn.overs ?? "")} Ov${rr ? ", RR " + rr : ""})</span></span></div>
-    ${dnb.length ? `<div class="line"><span class="mut">Did not bat:</span> ${dnb.map(b => esc(b.name)).join(", ")}</div>` : ""}</div>
+    ${dnb.length ? `<div class="line"><span class="mut">${inn.cur && detail.match?.state === "live" ? "Yet to bat" : "Did not bat"}:</span> ${dnb.map(b => esc(b.name)).join(", ")}</div>` : ""}</div>
     ${inn.fow.length ? `<div class="box"><h4><span>Fall of wickets</span></h4><div class="line">${inn.fow.map(w => `<b>${esc(w.r)}-${esc(w.n)}</b> ${esc(w.who)} <span class="mut">(${esc(w.o)} ov)</span>`).join(", ")}</div></div>` : ""}
-    <div class="box"><h4><span>Bowling</span></h4>${bowlTable(inn.bowl) || `<div class="line mut">No bowling figures</div>`}</div>`;
+    <div class="box"><h4><span>Bowling</span></h4>${bowlTable(inn.bowl) || `<div class="line mut">No bowling figures</div>`}</div>
+    ${inn.parts?.length ? `<div class="box"><h4><span>Partnerships</span></h4>${inn.parts.map(p => `<div class="line" style="display:flex;justify-content:space-between;gap:8px"><span><span class="mut">${esc(p.wk)} wkt</span> ${esc(p.a)} ${esc(p.ar)} & ${esc(p.b)} ${esc(p.br)}</span><b>${esc(p.runs)} <span class="mut" style="font-weight:400">(${esc(p.overs)})</span></b></div>`).join("")}</div>` : ""}`;
 }
 function commList(cs) {
   let h = "", lastOver = null;
@@ -555,6 +669,7 @@ function commList(cs) {
     if (lastOver != null && c.over !== lastOver && c.over != null) h += `<div class="overend">End of over ${esc(c.over)}</div>`;
     lastOver = c.over;
     const [l, k] = ballLabel(c);
+    if (c.post) h += `<div class="overend" style="font-weight:400;white-space:pre-line">${esc(c.post)}</div>`;
     h += `<div class="com"><div class="ov"><div>${esc(c.ov)}</div><span class="ball ${k}">${esc(l)}</span></div>
       <div class="tx"><b>${esc(c.title)}</b>${c.title ? ", " : ""}${esc(c.text)}${c.wkt && c.dis ? `<div class="dis">${esc(c.dis)}</div>` : ""}</div></div>`;
   }
@@ -565,6 +680,8 @@ function commTab() {
   return `<div class="box">${commList(detail.comments)}</div><div class="note">Shows the latest overs from ESPNcricinfo. Pull fresh balls with ↻ (auto-refreshes during live play).</div>`;
 }
 function infoTab() {
+  if (detail.info) return `<div class="box"><h4><span>Match info</span></h4>${detail.info.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("") || `<div class="line mut">No details yet</div>`}</div>` +
+    (detail.match?.link ? `<a class="btn ghost" href="${esc(detail.match.link)}" target="_blank" rel="noopener">Open on ESPNcricinfo</a>` : "");
   const m = detail.match || {}, r = detail.raw || {};
   const teams = m.teams || [];
   const tossTeam = teams.find(t => t.id != null && t.id === r.tossWinnerTeamId);
@@ -587,16 +704,16 @@ function infoTab() {
 function viewMore() {
   V.innerHTML = `<div class="sec">Data connection</div>
   <div class="form">
-    <label>Relay URL<input id="fRelay" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://crease-relay.yourname.workers.dev" value="${esc(cfg.relay)}"></label>
+    <label>News relay URL<input id="fRelay" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://crease-relay.yourname.workers.dev" value="${esc(cfg.relay)}"></label>
     <label>Relay password (optional)<input id="fKey" type="password" autocomplete="off" value="${esc(cfg.key)}"></label>
     <label>Auto-refresh during live play<select id="fRef">${[10, 20, 30, 60, 0].map(s => `<option value="${s}" ${+cfg.refresh === s ? "selected" : ""}>${s ? "Every " + s + " seconds" : "Off"}</option>`).join("")}</select></label>
     <label class="sw">Demo data (no relay needed)<input id="fDemo" type="checkbox" ${cfg.demo ? "checked" : ""}></label>
   </div>
   <button class="btn" id="saveBtn">Save</button>
-  <button class="btn ghost" id="testBtn">Test relay</button>
+  <button class="btn ghost" id="testBtn">Test connection</button>
   <div class="note" id="testOut"></div>
   <div class="sec">About</div>
-  <div class="form"><div class="line">Crease ${VERSION} – ad-free live cricket. Scores, scorecards, ball-by-ball commentary and news come from ESPNcricinfo through your own relay. Unofficial app for personal use.</div>
+  <div class="form"><div class="line">Crease ${VERSION} – ad-free live cricket. Scores, scorecards and ball-by-ball commentary come from ESPNcricinfo (via ESPN's sports data feed); news comes from the ESPNcricinfo news feed through your relay. Unofficial app for personal use.</div>
   <button class="line" id="clearBtn" style="width:100%;text-align:left;color:var(--live)">Clear saved data</button></div>`;
   const read = () => { cfg.relay = $("#fRelay").value.trim().replace(/\/+$/, ""); cfg.key = $("#fKey").value; cfg.refresh = +$("#fRef").value; cfg.demo = $("#fDemo").checked; saveCfg(); };
   $("#saveBtn").onclick = () => { read(); toast("Saved"); };
@@ -604,11 +721,11 @@ function viewMore() {
     read(); const out = $("#testOut"); out.textContent = "Testing…";
     try {
       const p = await (await relayFetch("/ping")).json();
-      if (!p.ok) throw new Error("Unexpected answer");
-      out.textContent = "✅ Relay reachable. Checking ESPNcricinfo…";
-      const d = await (await relayFetch("/api/pages/matches/current", { lang: "en", latest: "true" })).json();
-      const n = collect(d.data, isMatchArr).reduce((a, x) => a + x.length, 0);
-      out.textContent = n ? `✅ Works – ${n} matches found (via ${d.source === "api" ? "ESPNcricinfo API" : "ESPNcricinfo page"}).` : "⚠️ Relay answered but no matches were found.";
+      if (!p.ok) throw new Error("Relay gave an unexpected answer");
+      const h = await getJSON(ESPN + "/v2/scoreboard/header?sport=cricket&lang=en&region=gb");
+      const n = (h.sports?.[0]?.leagues || []).reduce((a, l) => a + (l.events || []).length, 0);
+      const news = await getNews().catch(() => []);
+      out.textContent = `✅ Scores: ${n} matches found • News: ${news.length} stories`;
     } catch (e) { out.textContent = "❌ " + (e.message === "NO_RELAY" ? "Enter the relay URL first." : e.message); }
   };
   $("#clearBtn").onclick = () => { ["cache.matches", "cache.news"].forEach(k => localStorage.removeItem("crease." + k)); toast("Cleared"); };
